@@ -1,0 +1,269 @@
+openapi: 3.2.0
+info:
+  title: API мобильного приложения "Здоровье+"
+  version: 1.0.0
+  description: API для записи к врачу, оплаты и получения результатов
+
+servers:
+  - url: https://api.zdorovieplus.ru/api/v1
+    description: Production API
+
+paths:
+  /appointments:
+    get:
+      summary: Получение списка записей пациента
+      description: Возвращает список записей к врачу с возможностью фильтрации по статусу и пагинацией.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: Фильтр по статусу записи
+          required: false
+          schema:
+            type: string
+            enum:
+              - upcoming
+              - completed
+              - cancelled
+              - all
+            default: upcoming
+        - name: limit
+          in: query
+          description: Максимальное количество записей в ответе
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Смещение для пагинации (количество пропущенных записей)
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Успешный ответ с массивом записей
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                    description: Общее количество записей по фильтру
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Appointment'
+        '401':
+          description: Ошибка аутентификации (невалидный или отсутствующий JWT-токен)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Внутренняя ошибка сервера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Создание новой записи к врачу (Saga Orchestration)
+      description: |
+        Инициирует процесс записи к врачу (Saga). 
+        Создание идемпотентно: передавайте один и тот же `Idempotency-Key` для повторных попыток, чтобы избежать дублей.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Уникальный ключ идемпотентности (UUID). Генерируется на клиенте. Используется как `SagaId` в Orchestrator.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppointmentCreateRequest'
+      responses:
+        '202':
+          description: |
+            Запрос на создание записи принят в обработку (Асинхронный запуск Saga).
+            Клиент должен использовать `saga_id` для отслеживания статуса (предполагается отдельный эндпоинт статуса).
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URL для отслеживания статуса саги (GET /saga/{saga_id})
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentCreateResponse'
+              example:
+                saga_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: "PROCESSING"
+                message: "Запись инициирована. Дождитесь подтверждения в уведомлениях."
+        '400':
+          description: Невалидные входные данные (например, отрицательная сумма или прошедшая дата)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Конфликт выполнения (слот уже занят или истекло время бронирования)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "SLOT_UNAVAILABLE"
+                message: "Данное время уже занято другим пациентом."
+                trace_id: "trace-111"
+        '422':
+          description: Ошибка валидации бизнес-правил (например, полис ДМС не найден или не покрывает услугу)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    AppointmentCreateRequest:
+      type: object
+      required:
+        - doctor_id
+        - slot_time_start
+        - clinic_id
+        - service_type
+      properties:
+        doctor_id:
+          type: string
+          format: uuid
+          description: UUID врача
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        clinic_id:
+          type: string
+          format: uuid
+          description: UUID клиники
+          example: "b2c3d4e5-f6g7-8901-bcde-f23456789012"
+        slot_time_start:
+          type: string
+          format: date-time
+          description: Дата и время начала приема (ISO 8601)
+          example: "2025-08-20T10:30:00+03:00"
+        service_type:
+          type: string
+          enum: [consultation, lab_test, procedure]
+          description: Тип услуги
+          example: "consultation"
+        patient_comment:
+          type: string
+          maxLength: 500
+          description: Дополнительная информация для врача (опционально)
+        payment_method:
+          type: string
+          enum: [card, wallet, insurance]
+          default: card
+          description: Способ оплаты
+        insurance_policy_number:
+          type: string
+          description: Номер полиса ДМС (обязателен, если payment_method = insurance)
+    AppointmentCreateResponse:
+      type: object
+      properties:
+        saga_id:
+          type: string
+          format: uuid
+          description: Идентификатор саги для отслеживания статуса
+        status:
+          type: string
+          enum: [PROCESSING, CONFIRMED, CANCELLED, FAILED]
+          description: Текущий статус операции записи
+        message:
+          type: string
+          description: Человекочитаемый статус для UI
+    Appointment:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Уникальный идентификатор записи (UUID)
+        doctor_name:
+          type: string
+          description: ФИО врача
+        specialty:
+          type: string
+          description: Специализация врача
+        clinic_name:
+          type: string
+          description: Название клиники
+        address:
+          type: string
+          description: Адрес клиники
+        date_time:
+          type: string
+          format: date-time
+          description: Дата и время записи (ISO 8601)
+        status:
+          type: string
+          enum: [pending, confirmed, cancelled, completed]
+          description: Технический статус записи
+        status_display:
+          type: string
+          description: Человекочитаемый статус для отображения в UI
+        payment_status:
+          type: string
+          enum: [pending, paid, failed, refunded]
+          description: Статус оплаты
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Код ошибки
+          example: "SLOT_UNAVAILABLE"
+        message:
+          type: string
+          description: Человекочитаемое описание ошибки
+          example: "Выбранное время уже занято."
+        trace_id:
+          type: string
+          description: Идентификатор запроса для связи с логами
+          example: "trace-abc-123"
+
+
+
+Пояснение к выбранным подходам
+Версионирование API (URL-версионирование): Выбран подход с версией в URL (/api/v1/...). Это наиболее явный и простой способ для мобильных приложений, так как клиент (приложение) всегда знает, какую версию вызывает. При изменении контракта создаётся новая версия (/api/v2/...), а старая поддерживается для старых версий приложения (обратная совместимость).
+
+Пагинация (limit + offset): Выбран классический подход с limit и offset. Он прост в реализации и понятен клиентам. Для мобильного приложения с вертикальным скроллингом этого достаточно. В будущем, при необходимости, можно добавить cursor-based пагинацию для повышения производительности на больших объёмах данных.
+
+Пояснение к изменениям 
+Почему мы выбрали асинхронный ответ 202 (Accepted) вместо синхронного 200?
+Это прямая реализация архитектурного решения из Задания 3.2 (Saga Orchestration).
+Так как процесс включает в себя каскад шагов (Проверка 1С → Бронирование → Оплата → LIS), он может занимать от 2 до 10 секунд.
+Держать пациенту экран загрузки 10 секунд — плохой UX.
+Вместо этого мобильное приложение мгновенно получает saga_id, а финальный результат (успех/отказ) приходит через WebSocket или PUSH-уведомление (как раз то, что делает Notification Service в нашей архитектуре).
+Это делает систему отзывчивой и позволяет разгрузить API Gateway от долгих таймаутов.
+
+Идемпотентность в POST:
+Idempotency-Key передан в HTTP-заголовке. Это стандартный паттерн (RFC 7231), позволяющий мобильному приложению безопасно повторять запрос при обрыве сети. API Gateway использует этот ключ как SagaId для Orchestrator, гарантируя, что один и тот же пациент не создаст две записи на один слот за 5 минут.
+          
